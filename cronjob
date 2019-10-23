@@ -1,0 +1,20 @@
+#! /bin/bash -
+
+dir="$(dirname $(readlink -f ${BASH_SOURCE[0]}))"
+cd "$dir"
+source utilities.sh
+
+last=$(find update_logs | sort -t. -k2 -n | tail -n1 | \
+    sed 's|.*/\([^.]*\)\..*|\1|') 2> /dev/null
+running=$(get_running --name="finding duplicates")
+
+if [[ "$last" == "update_dupes" ]]; then
+    >&2 printf 'There are no logs after the last run of update_dupes.\n'
+    >&2 printf 'The cronjob will be skipped.\n'
+elif [[ ! -z "$running" ]]; then
+    >&2 printf 'An instance of update_dupes with slurm id '
+    >&2 printf '%s is already runnign.\n' "$running"
+    >&2 printf 'The cronjob will be skipped.\n'
+else
+    ./update_dupes
+fi

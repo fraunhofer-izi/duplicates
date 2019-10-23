@@ -1,0 +1,73 @@
+#! /bin/bash -
+
+# This script uses the sorted_file_hases.out to
+# quickly estimate file and directory sizes of
+# all passed paths. It also exepts globbings.
+# Usage: ./du <path1> <path2> ...
+
+export LC_ALL=C # byte-wise sorting
+export OPTERR=0 # silent getopts
+dir="$(dirname $(readlink -f ${BASH_SOURCE[0]}))"
+export look="$dir/look"
+export sorted_filehashes="$dir/sorted_file_hashes.out"
+export dirhashes="$dir/dir_hashes.out"
+
+read -d '' help_message << EOF
+Usage $0 [-q, --quick] <path1> <path2> ...
+
+-q, --quick : Quick mode (requires dir_hashes e.g. by update_dupes).
+EOF
+
+disp_help(){
+    printf '%s\n' "$help_message"
+}
+
+get_func="slow_getsize"
+while getopts "h?q-:" opt; do
+    case "$opt" in
+    -) case "${OPTARG}" in
+        quick) QUICK=TRUE;;
+        help) disp_help
+            exit 0;;
+        *)  disp_help
+            exit 1;;
+        esac ;;
+    q)  get_func="quick_getsize";;
+    h)  disp_help
+        exit 0;;
+    *)  disp_help
+        exit 1;;
+    esac
+done
+
+slow_getsize(){
+    f="$(realpath "$*")"
+    path="${f//\\/\\\\}"
+    path="${path//$'\n'/\\n}"
+    size=$(cat <("$look" "$path" "$sorted_filehashes") <(printf "0,0,0") | \
+        parallel --will-cite --pipe \
+        "sed -e 's/.*,\([0-9]*\),[^,]*$/\1/g' -e '/[^0-9]/d'" | paste -sd+ | bc)
+    size=$(numfmt --to=iec $size)
+    printf '%s\t%s\n' "$size" "$*"
+}
+quick_getsize(){
+    f="$(realpath "$*")"
+    path="${f//\\/\\\\}"
+    path="${path//$'\n'/\\n}"
+    if [[ -d "$f" ]]; then
+        SIZE="$(grep -F ",$path/" "$dirhashes" | cut -d, -f1 | \
+            awk 'BEGIN{a=0}{if ($1>0+a) a=$1} END{print a}')"
+    elif [[ -f "$f" ]]; then
+        SIZE=$("$look" "$path," "$sorted_filehashes" | head -n1 | \
+            sed -n 's/^.*,\([0-9]*\),[^,]*$/\1/p')
+    else
+        m="Error: Type of %s cannot be determined since it does not exist.\\n"
+        >&2 printf "$m" "$*"
+        return
+    fi
+    [[ -z "$SIZE" ]] && SIZE="0" || SIZE="$(numfmt --to=iec "$SIZE")"
+    printf '%s\t%s\n' "$SIZE" "$*"
+}
+export -f slow_getsize quick_getsize
+
+printf '%s\0' "${@:$OPTIND}" | parallel --will-cite -k -0 "$get_func"

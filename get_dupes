@@ -1,0 +1,81 @@
+#! /bin/bash -
+
+inFiles="dir_hashes.out file_hashes.out"
+outFile="dupes.out"
+nthreads=$(nproc)
+
+export LC_ALL=C # byte-wise sorting
+export OPTERR=0 # silent getopts
+[[ -z "$TMPDIR" ]] && export TMPDIR=/dev/shm # in memory
+
+read -d '' help_message << EOF
+Usage $0 [-s, --skip] [-j number] [-i input] [-i input2] ... [-o output]
+
+-s, --skip : Skip removal of subdirectories of duplicates.
+-j number  : Maximum number of threads. (Default $nthreads)
+-i input   : Input file. Can be used multipe times. (Defaults $inFiles)
+-w output  : Output file with subdirectories.
+-o output  : Output file without subdirectories. (Default $outFile)
+EOF
+
+disp_help(){
+    printf '%s\n' "$help_message"
+}
+trap exit ERR
+
+unset woutFile
+while getopts "h?sj:i:o:w:-:" opt; do
+    case "$opt" in
+    -) case "${OPTARG}" in
+        skip) SKIPSUB=1;;
+        help) disp_help
+            exit 0;;
+        *)  disp_help
+            exit 1;;
+        esac ;;
+    s)  SKIPSUB="TRUE";;
+    i)  oinFiles+=("$OPTARG");;
+    o)  outFile="$OPTARG";;
+    w)  woutFile="$OPTARG";;
+    j)  nthreads="$OPTARG";;
+    h)  disp_help
+        exit 0;;
+    *)  disp_help
+        exit 1;;
+    esac
+done
+[[ -z $oinFiles ]] || inFiles="${oinFiles[@]}"
+[[ "$nthreads" =~ ^[0-9]+$ ]] || { disp_help; exit 1; }
+[[ -z "$woutFile" ]] && woutFile="${outFile%.out}_with_subs.out"
+
+tempHashes=$(mktemp)
+tempPatterns=$(mktemp)
+tempOut=$(mktemp)
+trap exit INT TERM ERR HUP
+trapF(){
+    rm -r $tempHashes $tempPatterns $tempOut \
+        $tempOut2 2> /dev/null
+    exit
+}
+trap trapF EXIT
+sortThreads=$(($nthreads<8?$nthreads:8))
+
+printf 'Sorting by size and hash...\n'
+cat $inFiles | grep -va "^#\|^%\|^0," | \
+    sort --parallel=$sortThreads -S 50% \
+    -t / -k 1 -o $tempHashes
+
+printf 'Collecting duplicate hashes...\n'
+cut -d / -f 1 $tempHashes | uniq -d > $tempPatterns
+
+printf 'Filtering none duplicates...\n'
+join -t / -j 1 $tempPatterns $tempHashes > $tempOut
+
+printf 'Sorting results...\n'
+sort -u -o "$woutFile" $tempOut
+
+[[ "$SKIPSUB" == "TRUE" ]] && exit 0
+
+printf 'Removing sub-directories of duplicates...\n'
+source utilities.sh
+sub_remove $tempOut $nthreads --delete | sizeHashSort > "$outFile"

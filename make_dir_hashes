@@ -1,0 +1,112 @@
+#! /bin/bash -
+#SBATCH --job-name="directory hashes"
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=140G
+#SBATCH --time=10-00:00:00
+#SBATCH --mail-type=ALL
+#SBATCH --out=make_dir_hashes.out
+
+inFile="sorted_file_hashes.out"
+outFile="dir_hashes.out"
+processOut=".dir_hashes.process.out"
+
+if [[ -z $SLURM_CPUS_PER_TASK ]]; then
+    nCPU=$(nproc)
+else
+    nCPU=$SLURM_CPUS_PER_TASK
+fi
+
+export procID=$$
+export LC_ALL=C # byte-wise sorting
+[[ -z "$TMPDIR" ]] && export TMPDIR=/dev/shm # in memory
+export tdir=$(mktemp -d)
+export token_f=$(mktemp)
+progress=$(mktemp)
+ln -s "$(readlink -f "$inFile")" $tdir.out
+trap '>&2 printf "\rInterrupted (Ctrl+C)...\n"; exit 130' INT
+trap '>&2 printf "Terminated (kill)...\n"; exit 143' TERM
+trap '>&2 printf "Connection to user lost...\n"; exit 129' HUP
+trap '>&2 printf "Broken pipe...\n"; exit 141' PIPE
+trapF(){
+    ec=$?
+    exec 2> /dev/null
+    trap '' INT && kill -INT -- -"$BASHPID"
+    rm -r $tdir $progress $tdir.out $token_f $processOut
+    exit $ec
+}
+trap "trapF" EXIT
+
+printf '%d' "$((nCPU-1))" > $token_f
+takeTokens(){
+    (
+        flock -x -w .01 200 || exit 1
+        tokens=$(<$token_f)
+        spend=$(($tokens>$1?$1:$tokens))
+        printf '%d' $(($tokens-$spend)) > $token_f
+        printf '%d' $spend
+    ) 200<> $token_f
+}
+releaseToken(){
+    (
+        flock -x 200
+        tokens=$(<$token_f)
+        printf '%d' $(($tokens+1)) > $token_f
+    ) 200<> $token_f
+}
+makeHashes()(
+    hashtab="$1"
+    nthread_parent=$2
+    file_token="../$3"
+    outDir="${hashtab%.out}"
+    DPATH="${outDir#$tdir}/"
+    mkdir -p "$outDir"
+    cd "$outDir"
+    exec 10<> <(:)
+    SIZE=$(cut -d / -f 1 --complement "$hashtab" | \
+        tee >(sha256sum >&10) | \
+        awk -F/ '{if (NF>1) print>$1".out"; else print}' | \
+            sed 's/^.*,\([0-9]*\),[^,]*$/\1/g' | \
+            tee >(xargs -n1 -I{} printf '1' >&4) | paste -sd+ | bc)
+    read -u 10 HASH dash
+    rm "$hashtab"
+    next=()
+    while IFS=  read -r -d $'\0'; do
+            next+=("$REPLY")
+    done < <(find "$outDir" -type f -print0)
+    if ((${#next[@]}>0)); then
+        new_file_token=$(mktemp -p .)
+        printf '%d' ${#next[@]} > $new_file_token
+        nthread=$(($(takeTokens $((${#next[@]}-1)))+1)) || nthread=1
+        size=$(printf '%s\0' "${next[@]}" | sed -z -e "s/'/'\"'\"'/g" | \
+            xargs -0 -n 1 -P $nthread -I{} \
+            bash -c "makeHashes '{}' $nthread $new_file_token" | \
+            paste -sd+ | bc)
+            SIZE=$(($SIZE+$size))
+    fi
+    printf '%01d\n' "$SIZE"
+    >&3 printf '%01d,%s,%s\n' "$SIZE" "$HASH" "$DPATH"
+    rm -r "$outDir"
+    (($nthread_parent>1)) && (
+        flock -x 200
+        tokens=$(<$file_token)
+        (($tokens<$nthread_parent)) && releaseToken && return
+        printf '%d' $(($tokens-1)) > $file_token
+    ) 200<> $file_token
+)
+export -f makeHashes takeTokens releaseToken
+
+trap 'exit 0' SIGUSR1
+./watch_dir_hashing $progress "$inFile" &
+statusPID=$!
+
+printf '## Format: size,sha256,path\n' > "$processOut"
+export thread_id=0
+size=$(makeHashes "$tdir.out" 1 3>> "$processOut" 4> $progress)
+size=$(numfmt --to=iec $size)
+kill -SIGUSR1 -- "$statusPID"
+mv "$processOut" "$outFile"
+wait $statusPID
+printf 'Files with a total size of\e[34m %s\e[0m ' "$size"
+printf 'have been hashed into directories.\n'
+

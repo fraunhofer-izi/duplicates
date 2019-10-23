@@ -1,0 +1,18 @@
+#! /bin/bash -
+
+# This scripts appends a human readable file size to the
+# beginning of each line for files with the line format
+# <bytse size>,<something else>
+# and prints the result stdout.
+# Usage: ./human_sizes <input>
+
+if [[ -z "$*" ]]
+then
+    inFile="dupes.out"
+else
+    inFile="$*"
+fi
+
+export LC_ALL=C # so sed works with wired chars
+
+paste <(cut -d, -f1 "$inFile" | numfmt --to=iec) "$inFile"

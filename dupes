@@ -1,0 +1,97 @@
+#! /bin/bash -
+
+# Usage: ./dupes [-r, --recursive] <path1> <path2> ...
+# Finds all duplicates of the passed paths and when
+# the -r obtion is passed, all duplicate files within.
+
+export dir="$(dirname $(readlink -f ${BASH_SOURCE[0]}))"
+source "$dir/utilities.sh"
+
+if [[ "$1" == "-r" ]] || [[ "$1" == "--recursive" ]]; then
+    REC=TRUE
+elif [[ "$1" == "-h" ]] || [[ "$1" == "--help" ]]; then
+    >&2 printf "Usage: $0 [-r, --recursive] <dir1> <dir2> ...\n"
+    exit 0
+else
+    REC=FALSE
+fi
+
+export LC_ALL=C # byte-wise sorting
+export GREP_COLOR='32'
+
+export dirhashs="$dir/dir_hashes.out"
+export sorted_filehashes="$dir/sorted_file_hashes.out"
+export sorted_dupes="$dir/dupes_with_subs.out"
+
+(readlink $(type -p mup) | grep "update_file_hashes$") &> /dev/null && \
+    export SMUP="mup" || export SMUP="update_file_hashes"
+
+search_recursive(){
+    arg="$1"
+    [ $TITLE == TRUE ] && printf '\e[33mDuplicates in %s:\e[0m\n' "$arg"
+    fl="$(realpath "$arg")"
+    path="${fl//\\/\\\\\\\\}"
+    path="${path//$'\n'/\\\\n}"
+    path="${path//\"/\\\"}"
+    dupes=$(parallel --will-cite --pipepart -a "$sorted_dupes" \
+        "grep -aF \",$path\"" | sub_remove)
+    if [[ -z "$dupes" ]]; then
+        >&2 printf 'No duplicates found in %s.\n'  "$arg"
+        exit 0
+    fi
+    printf '%s\n' "$dupes"
+}
+
+list_dupes(){
+    arg="$1"
+    fl="$(readlink -f "$arg")"
+    path="${fl//\\/\\\\}"
+    path="${path//$'\n'/\\n}"
+    unset tag
+    if [[ -d "$fl" ]]; then
+        tag=$(grep -aF ",$path/" "$dirhashs" | sub_remove | cut -d, -f1,2)
+        if [[ -z $tag ]]; then
+            >&2 printf 'The directory %s has not been hashed yet.\n' "$arg"
+            >&2 printf 'Run `%s %s` and `update_dupes` first!\n' "$SMUP" "$arg"
+            exit 1
+        fi
+    elif [[ -f "$fl" ]]; then
+        tag=$("$dir/look" "$path," "$sorted_filehashes" | \
+            sed -n 's/.*,\([0-9]*,[^,]*\)$/\1/p')
+        if [[ -z $tag ]]; then
+            >&2 printf 'The filte %s has not been hashed yet.\n' "$arg"
+            >&2 printf 'Run `update_dupes` first!\n'
+            exit 1
+        fi
+    elif [[ "$arg" =~ ^[0-9]+,[^,]+,?$ ]]; then
+        tag="$arg"
+    elif [[ "$arg" =~ ^[0-9]+,[^,]+ ]]; then
+        path="${arg#*,*,}"
+        tag="${arg%"$path"}"
+        arg="$path"
+    fi
+    if [[ -z "$tag" ]]; then
+        >&2 printf 'Using slow pattern search for %s.\n' "$arg"
+        >&2 printf 'Pass "<byte size>,<hash>" or "<path>" for faster results.\n'
+        dupes=$(grep --color=always -aF "$arg" "$sorted_dupes")
+    else
+        tag="${tag%,},"
+        dupes=$("$dir/look" $tag "$sorted_dupes" | grep -vF "$tag$path")
+    fi
+    if [[ -z "$dupes" ]]; then
+        >&2 printf '\e[33mNo duplicate found for %s.\e[0m\n'  "$arg"
+        exit 0
+    fi
+    ndupes=$(printf "%s" "$dupes" | grep -c "^")
+    (( $ndupes > 1 )) && s="s" || s=""
+    printf '\e[33m%d duplicate%s of %s:\e[0m\n' "$ndupes" "$s" "$arg"
+    printf '%s\n' "$dupes"
+}
+export -f search_recursive list_dupes sub_remove
+
+if [ $REC == TRUE ]; then
+    (($#!=2)) && [ -t 1 ] && export TITLE=TRUE || export TITLE=FALSE
+    parallel --will-cite -k -n1 search_recursive ::: "${@:2}"
+else
+    parallel --will-cite -k -n1 list_dupes ::: "$@"
+fi

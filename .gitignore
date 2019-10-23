@@ -1,0 +1,12 @@
+group
+*.out
+*.trash
+*.err
+*.lock
+.nfs*
+current_state
+
+bsdmainutils/
+du.sh
+disk_usage.sh
+update_logs/

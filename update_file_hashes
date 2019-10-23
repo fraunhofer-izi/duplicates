@@ -1,0 +1,244 @@
+#! /bin/bash -
+#SBATCH --job-name="file hash update"
+#SBATCH --ntasks=1
+#SBATCH --exclusive
+#SBATCH --mem=140G
+#SBATCH --time=10-00:00:00
+#SBATCH --mail-type=ALL
+
+# This script updates/includes the file hashes for
+# any given directories.
+# Usage: ./update_file_hashes [-l, --local] <dir1> <dir2> ...
+
+if [[ "$1" == "-l" ]] || [[ "$1" == "--local" ]]; then
+    send_slurm=FALSE
+    ARGS=("${@:2}")
+elif [[ "$1" == "-h" ]] || [[ "$1" == "--help" ]]; then
+    >&2 printf "Usage: $0 [-l, --local] <dir1> <dir2> ...\n"
+    exit 0
+elif (hash sbatch &> /dev/null); then
+    send_slurm=TRUE
+    ARGS=("$@")
+else
+    send_slurm=FALSE
+    ARGS=("$@")
+fi
+
+if [[ -z "$SLURM_SUBMIT_DIR" ]]; then
+    onSlurm=FALSE
+    export SortBuffer=100G
+    unset argDir
+elif [[ "$1" != "--prepared" ]]; then
+    >&2 printf 'Error: manual sbatch execution\n'
+    exit 1
+else
+    onSlurm=TRUE
+    send_slurm=FALSE
+    argDir="$SLURM_SUBMIT_DIR/"
+    ARGS=("${@:2}")
+fi
+
+epoch=$(date +%s)
+logPart="update_logs/update_file_hashes.$epoch"
+if [ $onSlurm == FALSE ]; then
+    export dir="$(dirname $(readlink -f ${BASH_SOURCE[0]}))"
+    logFile="$dir/$logPart.log"
+else
+    export dir="$(pwd -P)"
+    if [[ -z "$slurmLog" ]]; then
+        slurmLog="$dir/$logPart.slurm"
+    else
+        epoch="${slurmLog%.*}"
+        epoch="${epoch##*.}"
+    fi
+    logFile="${slurmLog%.*}.log"
+fi
+recoveryTries=5
+outFile="$dir/file_hashes.out"
+backupDir="$dir/backups"
+backup="$backupDir/file_hashes.backup.$epoch.out"
+sortedOutFile="$dir/sorted_file_hashes.out"
+sortedProcessOut="$dir/.sorted_file_hashes.inProcess.out"
+stateLog="${logFile%.*}.progress"
+logDir="$(dirname $logFile)"
+lockFile="$dir/update_file_hashes.lock"
+if [ -f "$dir/group" ]; then
+    export HASH_GROUP=$(head -n1 "$dir/group")
+fi
+if ! getent group "$HASH_GROUP" &> /dev/null; then
+    >&2 printf 'The group "%s" does not exists and is ignored.' "$HASH_GROUP"
+    unset HASH_GROUP
+fi
+
+source "$dir/utilities.sh"
+
+(($#==0)) && update_status && exit 0
+
+searchDirs=()
+for arg in "${ARGS[@]}"; do
+    if [[ "$arg" = /* ]]; then
+        absolut="$(readlink -f "$arg")"
+    else
+        absolut="$(readlink -f "${argDir}$arg")"
+    fi
+    if [[ ! -r "$absolut" ]] && [[ -z "$PURGE" ]]; then
+        >&2 printf 'The given file\e[33m %s\e[0m does not' "$arg"
+        >&2 printf ' exist or you have no read permissions. Exiting...\n'
+        exit 1
+    fi
+    searchDirs+=("$absolut")
+done
+searchDirsString=$(printf "'%s' " "${searchDirs[@]}")
+searchDirsString=${searchDirsString% }
+
+if [ $send_slurm == TRUE ]; then
+    printf 'Submitting slurm job for\e[34m %s\e[0m...\n' "$searchDirsString"
+    slurm_submit "$0" "${ARGS[@]}"
+    exit 0
+fi
+
+
+read -d '' lock_file_text << EOF
+=== File Hash Update ===
+Host: $(hostname)
+PID: $$
+Slurm Job ID: $SLURM_JOB_ID
+User: $USER
+Started: $(date)
+Directiories: $searchDirsString
+Backup: $backup
+Log: $logFile
+Progress: $stateLog
+Lockfile: $lockFile
+EOF
+read -d '' error_text 2> /dev/null << EOF
+A process already seems to be runnig:
+$(update_status)
+Delete the lockfile if this is not correct.
+EOF
+if [ $onSlurm == TRUE ] && [[ -f "$lockFile" ]]; then
+    info="If not cancelled the job will wait until the lockfile is removed."
+    printf '%s\n%s\n' "$error_text" "$info"
+    while [[ -f "$lockFile" ]]; do sleep 10; done
+fi
+if ! ( set -o noclobber; printf '%s\n' "$lock_file_text" > "$lockFile" ) \
+    2> /dev/null; then
+    >&2 printf '%s\n' "$error_text"
+    exit 1
+fi
+
+[ $onSlurm == TRUE ] && printf 'Running on\e[34m %s\e[0m.\n' "$(hostname)"
+printf 'Updating directorie(s)\e[34m %s\e[0m...\n' "$searchDirsString"
+printf 'Logging into\e[33m %s\e[0m...\n' "$logFile"
+mkdir -p "$logDir"
+sed "s/^/# /g" "$lockFile" > "$logFile"
+exec 2> >(trap '' INT TERM; tee -a "$logFile")
+tempOut=$(mktemp -p /dev/shm)
+mkdir -p "$backupDir"
+
+if [[ -z "$PURGE" ]]; then
+    printf 'Progress logged in\e[33m %s\e[0m...\n' "$stateLog"
+    (trap 'exit 0' SIGUSR1 TERM INT
+    exec > >(tee "$stateLog")
+    exec "$dir/watch_status" $tempOut "${searchDirs[@]}") &
+    statusPID=$!
+    if [[ ! -z "$HASH_GROUP" ]]; then
+        chown ":$HASH_GROUP" "$stateLog"
+        chmod g+rw "$stateLog"
+    fi
+else
+    unset statusPID
+fi
+if [[ ! -z "$HASH_GROUP" ]]; then
+    chown ":$HASH_GROUP" "$logDir" "$backupDir" 2> /dev/null
+    chmod g+rw "$logDir" "$backupDir" 2> /dev/null
+    chown ":$HASH_GROUP" $tempOut "$logFile" "$lockFile" "$slurmLog"
+    chmod g+r $tempOut "$lockFile"
+    chmod g+rw "$logFile" "$slurmLog"
+fi
+
+printf 'Creating backup\e[33m %s\e[0m and recovery trap...\n' "$backup"
+if [[ -f "$outFile" ]]; then
+    mv "$outFile" "$backup"
+else
+    touch "$backup"
+    if [[ ! -z "$HASH_GROUP" ]]; then
+        chown ":$HASH_GROUP" "$backup"
+        chmod g+rw "$backup"
+    fi
+    >&2 printf 'No results found. Initialized empty backup.\n'
+fi
+read -d '' note << EOF
+To revert to the backup manually run:
+mv '$backup' '$outFile'
+EOF
+trapF(){
+    excode=$?
+    printf '\r\e[31mStopping and attempting recovery...\e[0m\n'
+    trap '' INT && kill -INT -- -"$BASHPID"
+    wait $filterPID 2> /dev/null
+    [[ -f "$outFile" ]] && mv "$outFile" "$outFile.trash"
+    while ! (mv "$backup" "$outFile"); do
+        ((--recoveryTries))
+        if (($recoveryTries==0)); then
+            >&2 printf "\e[31m-----> Unable to recover backup. <-----\e[0m\n"
+            >&2 printf '%s\n' "$note"
+            break
+        fi
+        >&2 printf '\e[31mRecovery failed, %d tries left.\e[0m\n' \
+            "$recoveryTries"
+        sleep 5
+    done
+    rm "$sortedProcessOut" $tempOut "$lockFile" "$outFile.trash" 2> /dev/null
+    (($recoveryTries>0)) && >&2 printf 'Backup recovered.\n'
+    exit $excode
+}
+trap '>&2 printf "\rInterrupted (Ctrl+C)...\n"; exit 130' INT
+trap '>&2 printf "Terminated (kill)...\n"; exit 143' TERM
+trap 'ec=$?; >&2 printf "Error encountered...\n"; exit $ec' ERR
+trap '>&2 printf "Connection to user lost...\n"; exit 129' HUP
+trap '>&2 printf "Broken pipe...\n"; exit 141' PIPE
+trap trapF EXIT
+
+printf 'Start writing new\e[33m %s\e[0m without old entries...\n' "$outFile"
+grepC="grep -vaF"
+for path in "${searchDirs[@]}"; do
+    path="${path//\\/\\\\}"
+    path="${path//$'\n'/\\n}"
+    path="${path//\'/\'\"\'\"\'}"
+    printf -v grepC "%s -e ',%s/'" "$grepC" "$path"
+done
+printf -v grepC '%s "%s"' "$grepC" "$backup"
+(trap "exit 0" TERM; eval "$grepC" > "$outFile" || :) &
+filterPID=$!
+if [[ -z "$PURGE" ]]; then
+    >&2 printf 'Start hashing files into\e[33m %s\e[0m...\n' "$tempOut"
+    (trap "exit 0" TERM; hashThat "${searchDirs[@]}" > $tempOut) &
+    hashPID=$!
+else
+    >&2 printf 'Purging directorie(s)\e[31m %s\e[0m...\n' "$searchDirsString"
+    unset hashPID
+fi
+
+printf 'Waiting for processes and combining results...\n'
+if [[ -z "$PURGE" ]]; then
+    wait $hashPID
+    kill -SIGUSR1 -- $statusPID
+fi
+wait $filterPID
+cat $tempOut >> "$outFile"
+rm $tempOut
+wait $statusPID 2> /dev/null || :
+
+>&2 printf 'Sorting new results...\n'
+sortByPath "$outFile" > "$sortedProcessOut"
+mv "$sortedProcessOut" "$sortedOutFile"
+if [[ ! -z "$HASH_GROUP" ]]; then
+    chown ":$HASH_GROUP" "$outFile" "$sortedOutFile"
+    chmod g+rw "$outFile" "$sortedOutFile"
+fi
+trap - EXIT INT TERM ERR HUP
+rm "$lockFile"
+
+>&2 printf '\e[32mFinished successfully\e[0m on %s.\n' "$(date)"
+printf '%s\n' "$note"

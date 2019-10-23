@@ -1,0 +1,32 @@
+#! /bin/bash -
+
+# Emulates the output of sha256deep for the given directories
+# from the previously hashed table file_hashes.out
+if [[ "$1" == "-h" ]] || [[ "$1" == "--help" ]]; then
+    >&2 printf "Usage: $0 <dir>\n"
+    exit 0
+fi
+
+dir="$(dirname $(readlink -f ${BASH_SOURCE[0]}))"
+
+path="$(readlink -f "$1")"
+path="${path//\\/\\\\}"
+path="${path//$'\n'/\\n}"
+escaped=$(printf '%s' "$path" | \
+    sed -r 's/([\$\.\*\/\[\\^])/\\\1/g' | \
+    sed 's/[]]/\[]]/g')
+replace=$(printf '%s' "$1" | \
+    sed -r 's/(["&\/\\])/\\\1/g')
+
+printf -v pattern '^[0-9]*,[^,]*,%s' "$escaped"
+printf -v rep 's/\(^[0-9]*,[^,]*,\)%s/\\1%s/' "$escaped" "$replace"
+export pattern rep
+export LC_ALL=C # byte-wise sorting
+
+printf '%%%% hashdeep imitate by '
+printf 'https://github.com/fraunhofer-izi/duplicates\n'
+printf '%%%% size,sha256,filename\n'
+printf '## Invoked from: %s\n' "$(pwd -P)"
+
+parallel --will-cite -k --pipepart -a "$dir/file_hashes.out" \
+    --block 100M 'grep -e "$pattern" | sed -e "$rep"'

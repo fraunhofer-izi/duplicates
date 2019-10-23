@@ -1,0 +1,4 @@
+#! /bin/bash -
+
+uniques=$(cut -d/ -f1 file_dupes.out | uniq | cut -d, -f1 | paste -sd+ | bc)
+numfmt --to=iec $(( $(cut -d, -f1 file_dupes.out | paste -sd+ | bc)-$uniques ))

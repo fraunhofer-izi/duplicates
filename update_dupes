@@ -1,0 +1,80 @@
+#! /bin/bash -
+#SBATCH --job-name="finding duplicates"
+#SBATCH --ntasks=1
+#SBATCH --exclusive
+#SBATCH --mem=240G
+#SBATCH --time=10-00:00:00
+#SBATCH --mail-type=ALL
+
+[[ -z "$SLURM_JOB_ID" ]] && cd "$(dirname $(readlink -f ${BASH_SOURCE[0]}))"
+source utilities.sh
+
+if [[ "$1" == "-h" ]] || [[ "$1" == "--help" ]]; then
+    >&2 printf "Usage: $0 [-l, --local]\n"
+    exit 0
+elif [[ "$1" != "-l" ]] && [[ "$1" != "--local" ]] \
+    && [[ "$1" != "--prepared" ]] && (hash sbatch &> /dev/null); then
+    slurm_submit "$0" "finding duplicates"
+    exit 0
+fi
+
+export TMPDIR=/dev/shm
+if [[ -z "$SLURM_JOB_ID" ]]; then
+    epoch=$(date +%s)
+    logFile="update_logs/update_dupes.$epoch"
+    mkdir -p "$(dirname "$logFile")"
+    exec &> >(trap '' INT TERM; tee -a "$logFile")
+elif [[ "$1" != "--prepared" ]]; then
+    cmd="$(squeue -j $SLURM_JOB_ID -h -o '%o')"
+    >&2 printf 'Error: manual sbatch execution\n'
+    >&2 printf 'Usage: %s--slurm %s\n' "$cmd"
+    exit 1
+else
+    logFile="$slurmLog"
+fi
+lockFile="update_file_hashes.lock"
+read -d '' lock_file_text << EOF
+=== Finding Duplicates ===
+Host: $(hostname)
+PID: $$
+Slurm Job ID: $SLURM_JOB_ID
+User: $USER
+Started: $(date)
+Log: $logFile
+Progress: $logFile
+Lockfile: $(readlink -f "$lockFile")
+EOF
+read -d '' error_text 2> /dev/null << EOF
+A process already seems to be runnig:
+$(update_status)
+Delete the lockfile if this is not correct.
+EOF
+if ! ( set -o noclobber; printf '%s\n' "$lock_file_text" > "$lockFile" ) \
+    2> /dev/null; then
+    >&2 printf '%s\n' "$error_text"
+    exit 1
+fi
+trap '>&2 printf "\rInterrupted (Ctrl+C)...\n"; exit 130' INT
+trap '>&2 printf "Terminated (kill)...\n"; exit 143' TERM
+trap 'ec=$?; >&2 printf "Error encountered...\n"; exit $ec' ERR
+trap '>&2 printf "Connection to user lost...\n"; exit 129' HUP
+trap '>&2 printf "Broken pipe...\n"; exit 141' PIPE
+trap "rm \"$lockFile\"; trap '' INT; kill -INT -- -\"$BASHPID\"; exit 0" EXIT
+
+printf 'Finding duplicate files...\n'
+./get_dupes -s -i file_hashes.out -w file_dupes.out
+printf 'A list of duplicate files can be found'
+printf ' in\e[33m file_dupes.out\e[0m.\n'
+printf 'Calculating duplicate file size ...\n'
+printf 'You could safe\e[34m %s\e[0m' "$(./sum_duplicate_size)"
+printf ' by removing all duplicate files.\n'
+
+printf 'Making directory hashes...\n'
+./make_dir_hashes
+
+printf 'Finding all duplicates...\n'
+./get_dupes
+./human_sizes > human_dupes.out
+printf 'A list of duplicates can be found'
+printf ' in\e[33m dupes.out\e[0m and with human'
+printf ' frienly file sizes in\e[33m human_dupes.out\e[0m.\n'

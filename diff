@@ -1,0 +1,52 @@
+#! /bin/bash -
+
+# Returns the files that are unique among the dirs
+if [[ "$1" == "-h" ]] || [[ "$1" == "--help" ]]; then
+    >&2 printf "Usage: $0 <dir1> <dir2> ...\n"
+    exit 0
+fi
+
+dir="$(dirname $(readlink -f ${BASH_SOURCE[0]}))"
+export LC_ALL=C # byte-wise sorting
+export GREP_COLOR='32'
+export look="$dir/look"
+export sorted_filehashes="$dir/sorted_file_hashes.out"
+
+tempHashes=$(mktemp -p /dev/shm)
+tempOut=$(mktemp -p /dev/shm)
+trap "rm $tempHashes $tempOut" EXIT
+
+getFileHashes()(
+    path="$(readlink -f "$1")"
+    path="${path//\\/\\\\}"
+    path="${path//$'\n'/\\n}"
+    escaped=$(printf '%s' "$path" | \
+        sed -r 's/([\$\.\*\/\[\\^])/\\\1/g' | \
+        sed 's/[]]/\[]]/g')
+    replace=$(printf '%s' "$path" | \
+        sed -r 's/(["&\/\\])/\\\1/g')
+    modLine(){ sed "s|^$escaped|$replace/|g"; }
+    tempFile=$(mktemp -p /dev/shm)
+    trap "rm $tempFile" RETURN
+    "$look" "$path/" "$sorted_filehashes" | \
+        modLine > $tempFile
+    if [[ $? -ne 0 || ! -s $tempFile ]]; then
+        # fallback since look can not deal with special chars
+        text='\e[33mWarning:\e[0m No matches -> using slower grep for %s\n'
+        >&2 printf "$text" "$path"
+        grep -aF "$path" "$sorted_filehashes" | \
+        modLine > $tempFile
+    fi
+    if [[ ! -s $tempFile ]]; then
+        >&2 printf '\e[33mWarning:\e[0m No entries found for %s\n' "$path"
+    fi
+    cat $tempFile
+)
+export -f getFileHashes
+
+printf '%s\0' "$@" | parallel --will-cite -0 -k getFileHashes | tee $tempOut | \
+    sed 's|^.*//||g' | sort | uniq -u > $tempHashes
+ColorEsc=$(printf '\e[0m')
+grep -aFf $tempHashes --color=always $tempOut | \
+    sed "s|//|/|g; s/,[^,]*,[^,]*$/$ColorEsc/g"
+

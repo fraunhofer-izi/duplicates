@@ -1,0 +1,94 @@
+#! /bin/bash -
+
+# This script estimates the current state of the hashing
+# process by using `du` on all search directories
+# and prints it with the current time every 10 minutes.
+# Usage: ./watch_state <hash file> <dir1> <dir2> ...
+
+trap - EXIT
+trap 'exit 0' SIGUSR1
+
+minWait=10
+maxWait=600
+export LC_ALL=C # faster grep
+
+hashFile="$1"
+if [[ ! -z "$SLURM_JOB_ID" ]]; then
+    printf 'Starting progress monitoring at %s for %s.\n' "$(date)" "$hashFile"
+    printf 'Direcories: %s\n' "$(printf "'%s' " "${@:2}")"
+    printf 'Calculating total size...\n'
+    cd "$SLURM_SUBMIT_DIR"
+fi
+
+bytesHashed(){
+    cat <(grep -va "^#\|^%" "$hashFile" 2> /dev/null | cut -d, -f1) \
+        <(printf 0) | paste -sd+ | bc
+}
+hashStartTime=$(date +%s)
+hashStartState=$(bytesHashed)
+
+sleepUntil(){
+    local now=$(date +%s)
+    (( $1 > $now )) && sleep $(( $1 - $now ))
+}
+
+checkpoint=$(date +%s)
+total=$(du -sb --apparent-size -- "${@:2}" | \
+    cut -f1 | sed '/[^0-9]/d' | paste -sd+ | bc)
+TOTAL="$(numfmt --to=iec-i $total)B"
+waitTime=$(( $(date +%s) - $checkpoint ))
+waitTime=$(( $waitTime>$minWait?$waitTime:$minWait ))
+waitTime=$(( $waitTime<$maxWait?$waitTime:$maxWait ))
+
+displayTime(){
+  local T=$1
+  local D=$((T/60/60/24))
+  local H=$((T/60/60%24))
+  local M=$((T/60%60))
+  local S=$((T%60))
+  (( $D > 0 )) && printf '%d days ' $D
+  (( $H > 0 )) && printf '%d h ' $H
+  (( $M > 0 )) && printf '%d min ' $M
+  (( $D > 0 || $H > 0 || $M > 0 )) && printf 'and '
+  printf '%d sec\n' $S
+}
+# when `du` is quicker than the output of the super script:
+sleepUntil $(( $checkpoint + 1 ))
+printf 'Updating hashing progress every %s...\n' "$(displayTime $waitTime)"
+
+finished(){
+    printf '[%(%F %H:%M:%S)T] 100.00 %% (%s/%s)\n' \
+        "$(date +%s)" "$TOTAL" "$TOTAL"
+    exit 0
+}
+trap 'finished; exit 0' SIGUSR1
+lastTime=$hashStartTime
+lastState=$hashStartState
+while true; do
+    checkpoint=$(date +%s)
+    current=$(bytesHashed)
+    CURRENT=" ($(numfmt --to=iec-i $current)B/$TOTAL)"
+    printf -v state "%02d" $(( 10000 * $current / $total ))
+    STATE=" ${state:0:-2}.${state: -2} %"
+    time=$(date "+%F %H:%M:%S")
+    if [[ $current -le $hashStartState ]]; then
+        hashStartState=$current
+        SPEED=""
+        ETA=""
+    else
+        now=$(date +%s)
+        passed=$(( $now - $lastTime ))
+        lastTime=$now
+        diff=$(( $current - $lastState ))
+        lastState=$current
+        speed=$(( $diff / $passed ))
+        SPEED=" at $(numfmt --to=iec-i $speed)B/s"
+        total_passed=$(( $(date +%s) - $hashStartTime ))
+        total_diff=$(( $current - $hashStartState ))
+        rem=$(( $total - $current ))
+        eta=$(( $rem * $total_passed / $total_diff ))
+        ETA=" ~ $(displayTime $eta) remaining"
+    fi
+    printf '[%s]%s%s%s%s\n' "$time" "$STATE" "$CURRENT" "$SPEED" "$ETA"
+    sleepUntil $(( $checkpoint + $waitTime ))
+done
